@@ -1,12 +1,14 @@
-public class SHA3SHAKE {
+/*
+ * TCSS 487 Cryptography Project 1
+ * Authors: Rudolf Arakelyan (rudik30) and Linda Miao
+ *
+ * SHA-3/SHAKE implementation for FIPS 202. This Java implementation was
+ * written for the course project and was structurally inspired by Markku-Juhani
+ * Saarinen's tiny_sha3 C implementation:
+ * https://github.com/mjosaarinen/tiny_sha3/blob/master/sha3.c
+ */
 
-    // -------------------------------------------------------
-    // RC — round constants for the iota step
-    // 24 constants, one per round. These are fixed values
-    // defined by the Keccak spec. They break symmetry in the
-    // state so that each round produces a different scramble.
-    // Without them, all 24 rounds would do the same thing.
-    // -------------------------------------------------------
+public class SHA3SHAKE {
     private static final long[] RC = {
         0x0000000000000001L, 0x0000000000008082L,
         0x800000000000808AL, 0x8000000080008000L,
@@ -22,13 +24,6 @@ public class SHA3SHAKE {
         0x0000000080000001L, 0x8000000080008008L
     };
 
-    // -------------------------------------------------------
-    // RHO — rotation offsets for the rho step
-    // each lane gets rotated left by a different amount.
-    // this spreads bits across the 64-bit width of each lane.
-    // index matches lane index in the 5x5 grid (lane[i] rotates
-    // by RHO[i] bits).
-    // -------------------------------------------------------
     private static final int[] RHO = {
          0,  1, 62, 28, 27,
         36, 44,  6, 55, 20,
@@ -37,237 +32,309 @@ public class SHA3SHAKE {
         18,  2, 61, 56, 14
     };
 
-    // -------------------------------------------------------
-    // Fields — the sponge's internal memory
-    // -------------------------------------------------------
-    private long[] state;    // the 1600-bit state as 25 longs (5x5 grid)
-    private int bufLen;      // how many bytes we have absorbed into the
-                             // current block so far (0 to rate-1)
-    private int rate;        // rate in bytes — how many bytes per block
-                             // (depends on security level)
-    private int suffix;      // the suffix number passed to init()
-                             // e.g. 256 for SHA3-256 or SHAKE-256
-    private boolean squeezing; // false = absorbing, true = squeezing
-                               // once true, no more absorb() calls allowed
-    private byte domainByte; // 0x06 for SHA-3, 0x1F for SHAKE
-                             // tells Keccak which function family this is
-                             // (domain separation)
+    private static final byte DOMAIN_SHA3 = 0x06;
+    private static final byte DOMAIN_SHAKE = 0x1F;
 
-    // -------------------------------------------------------
-    // Constructor — nothing to do, init() sets everything up
-    // -------------------------------------------------------
-    public SHA3SHAKE() {}
+    private enum Mode {
+        UNINITIALIZED,
+        ABSORBING,
+        SQUEEZING,
+        DIGESTING
+    }
 
-    // -------------------------------------------------------
-    // init() — reset the sponge for a new hash
-    // must be called before absorb() or squeeze()
-    // -------------------------------------------------------
+    private long[] state;
+    private int bufLen;
+    private int rate;
+    private int suffix;
+    private Mode mode;
+    private byte[] digestCache;
+
+    public SHA3SHAKE() {
+        mode = Mode.UNINITIALIZED;
+    }
+
+    /**
+     * Initialize the SHA-3/SHAKE sponge.
+     * The suffix must be one of 224, 256, 384, or 512 for SHA-3, or one of 128 or 256 for SHAKE.
+     *
+     * @param suffix SHA-3/SHAKE suffix (SHA-3 digest bitlength = suffix, SHAKE sec level = suffix)
+     */
     public void init(int suffix) {
-        state = new long[25];  // fresh state — all 1600 bits = zero
+        state = new long[25];
         switch (suffix) {
-            // rate = (1600 - 2*security) / 8 bytes
-            // higher security = smaller rate = slower but safer
-            case 128: rate = 168; domainByte = 0x1F; break; // SHAKE-128
-            case 256: rate = 136; domainByte = 0x1F; break; // SHAKE-256
-            case 224: rate = 144; domainByte = 0x06; break; // SHA3-224
-            case 384: rate = 104; domainByte = 0x06; break; // SHA3-384
-            case 512: rate =  72; domainByte = 0x06; break; // SHA3-512
-            default: throw new IllegalArgumentException(
-                "suffix must be 128, 224, 256, 384 or 512");
+            case 128: rate = 168; break;
+            case 224: rate = 144; break;
+            case 256: rate = 136; break;
+            case 384: rate = 104; break;
+            case 512: rate = 72; break;
+            default:
+                throw new IllegalArgumentException("suffix must be 128, 224, 256, 384, or 512");
         }
+
         this.suffix = suffix;
-        bufLen = 0;       // no bytes absorbed yet
-        squeezing = false; // we are in absorb phase
+        bufLen = 0;
+        digestCache = null;
+        mode = Mode.ABSORBING;
     }
 
-    // initSHA3 — used by the static SHA3() method
-    // forces domainByte = 0x06 regardless of suffix number
-    // needed because SHA3-256 and SHAKE-256 both use suffix 256
-    // but need different domain bytes
-    private void initSHA3(int suffix) {
-        init(suffix);
-        domainByte = 0x06; // SHA-3 domain byte — overrides init()
-    }
-
-    // initSHAKE — used by the static SHAKE() method
-    // forces domainByte = 0x1F regardless of suffix number
-    private void initSHAKE(int suffix) {
-        init(suffix);
-        domainByte = 0x1F; // SHAKE domain byte — overrides init()
-    }
-
-    // -------------------------------------------------------
-    // absorb() — feed message bytes into the sponge
-    // -------------------------------------------------------
+    /**
+     * Update the SHAKE sponge with a byte-oriented data chunk.
+     *
+     * @param data byte-oriented data buffer
+     * @param pos initial index to hash from
+     * @param len byte count on the buffer
+     */
     public void absorb(byte[] data, int pos, int len) {
-        if (squeezing)
-            throw new IllegalStateException("cannot absorb after squeezing");
+        requireInitialized("absorb()");
+        if (mode != Mode.ABSORBING) {
+            throw new IllegalStateException("cannot absorb after squeeze()/digest(); call init() first");
+        }
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
+        if (pos < 0 || len < 0 || pos + len > data.length) {
+            throw new IllegalArgumentException("invalid pos/len for absorb()");
+        }
 
         for (int i = pos; i < pos + len; i++) {
-
-            // XOR one byte directly into the state at position bufLen
-            // bufLen/8  = which lane (0-24)
-            // bufLen%8  = which byte slot inside that lane (0-7)
-            // << shift  = move the byte into the correct bit position
-            // & 0xFF    = treat Java's signed byte as unsigned
-            state[bufLen / 8] ^= (long)(data[i] & 0xFF) << (8 * (bufLen % 8));
-
-            bufLen++; // move to next byte position
-
+            state[bufLen / 8] ^= (long) (data[i] & 0xFF) << (8 * (bufLen % 8));
+            bufLen++;
             if (bufLen == rate) {
-                // we have filled one complete rate-sized block
-                // scramble the state before accepting more input
-                keccakF();
-                bufLen = 0; // reset — ready for next block
-            }
-        }
-    }
-
-    // convenience overloads — simpler ways to call absorb()
-    public void absorb(byte[] data, int len) { absorb(data, 0, len); }
-    public void absorb(byte[] data) { absorb(data, 0, data.length); }
-
-    // -------------------------------------------------------
-    // squeeze() — read output bytes from the sponge
-    // -------------------------------------------------------
-    public byte[] squeeze(byte[] out, int len) {
-        if (!squeezing) {
-            // first squeeze call — must finalize input with padding first
-
-            // XOR the domain byte at the current position
-            // this marks the end of the message and identifies
-            // the function (SHA-3 vs SHAKE) — domain separation
-            state[bufLen / 8] ^= (long)(domainByte & 0xFF) << (8 * (bufLen % 8));
-
-            // XOR 0x80 into the very last byte of the rate block
-            // this is the pad10*1 rule — sets the final bit to 1
-            // together with the domain byte, this uniquely frames
-            // every message so no two different messages can
-            // produce the same padded block
-            state[(rate - 1) / 8] ^= 0x80L << (8 * ((rate - 1) % 8));
-
-            keccakF();       // scramble after padding
-            squeezing = true; // switch to squeeze phase
-            bufLen = 0;      // start reading from byte 0 of the state
-        }
-
-        for (int i = 0; i < len; i++) {
-            if (bufLen == rate) {
-                // we have read all rate bytes from the current state
-                // scramble again to produce the next block of output
                 keccakF();
                 bufLen = 0;
             }
-
-            // read one byte from the state at position bufLen
-            // same addressing as absorb — lane then byte slot
-            // >>> shifts the target byte down to the lowest 8 bits
-            // (byte) truncates — keeps only those 8 bits
-            out[i] = (byte)(state[bufLen / 8] >>> (8 * (bufLen % 8)));
-
-            bufLen++; // move to next byte position
         }
+    }
+
+    /**
+     * Update the SHAKE sponge with a byte-oriented data chunk.
+     *
+     * @param data byte-oriented data buffer
+     * @param len byte count on the buffer (starting at index 0)
+     */
+    public void absorb(byte[] data, int len) {
+        absorb(data, 0, len);
+    }
+
+    /**
+     * Update the SHAKE sponge with a byte-oriented data chunk.
+     *
+     * @param data byte-oriented data buffer
+     */
+    public void absorb(byte[] data) {
+        absorb(data, 0, data.length);
+    }
+
+    /**
+     * Squeeze a chunk of hashed bytes from the sponge.
+     * Call this method as many times as needed to extract the total desired number of bytes.
+     *
+     * @param out hash value buffer
+     * @param len desired number of squeezed bytes
+     * @return the out buffer containing the desired hash value
+     */
+    public byte[] squeeze(byte[] out, int len) {
+        requireInitialized("squeeze()");
+        if (mode == Mode.DIGESTING) {
+            throw new IllegalStateException("cannot call squeeze() after digest(); call init() first");
+        }
+        if (out == null) {
+            throw new NullPointerException("out");
+        }
+        if (len < 0 || len > out.length) {
+            throw new IllegalArgumentException("len must be between 0 and out.length");
+        }
+
+        if (mode == Mode.ABSORBING) {
+            finalizeAbsorb(selectSqueezeDomainByte());
+            mode = Mode.SQUEEZING;
+        }
+
+        squeezeInto(out, len);
         return out;
     }
 
-    // convenience overload — allocates output buffer for caller
-    public byte[] squeeze(int len) { return squeeze(new byte[len], len); }
+    /**
+     * Squeeze a chunk of hashed bytes from the sponge.
+     * Call this method as many times as needed to extract the total desired number of bytes.
+     *
+     * @param len desired number of squeezed bytes
+     * @return newly allocated buffer containing the desired hash value
+     */
+    public byte[] squeeze(int len) {
+        if (len < 0) {
+            throw new IllegalArgumentException("len must be >= 0");
+        }
+        return squeeze(new byte[len], len);
+    }
 
-    // -------------------------------------------------------
-    // digest() — squeeze a fixed-length SHA-3 hash
-    // -------------------------------------------------------
+    /**
+     * Squeeze a whole SHA-3 digest of hashed bytes from the sponge.
+     *
+     * @param out hash value buffer
+     * @return the out buffer containing the desired hash value
+     */
     public byte[] digest(byte[] out) {
-        squeeze(out, out.length); // squeeze exactly out.length bytes
+        requireInitialized("digest()");
+        if (mode == Mode.SQUEEZING) {
+            throw new IllegalStateException("cannot call digest() after squeeze(); call init() first");
+        }
+        if (suffix == 128) {
+            throw new IllegalStateException("digest() is not defined for SHAKE-128; use squeeze()");
+        }
+
+        int digestLen = suffix / 8;
+        if (out == null) {
+            out = new byte[digestLen];
+        }
+        if (out.length < digestLen) {
+            throw new IllegalArgumentException("out buffer is too small for digest");
+        }
+
+        if (mode == Mode.ABSORBING) {
+            finalizeAbsorb(DOMAIN_SHA3);
+            mode = Mode.DIGESTING;
+            digestCache = new byte[digestLen];
+            squeezeInto(digestCache, digestLen);
+        }
+
+        System.arraycopy(digestCache, 0, out, 0, digestLen);
         return out;
     }
 
+    /**
+     * Squeeze a whole SHA-3 digest of hashed bytes from the sponge.
+     *
+     * @return the desired hash value on a newly allocated byte array
+     */
     public byte[] digest() {
-        // suffix/8 = output size in bytes
-        // e.g. SHA3-256 → 256/8 = 32 bytes
-        return digest(new byte[suffix / 8]);
+        return digest(null);
     }
 
-    // -------------------------------------------------------
-    // SHA3() — static shortcut for one-shot SHA-3 hashing
-    // -------------------------------------------------------
+    /**
+     * Compute the streamlined SHA-3-<224,256,384,512> on input X.
+     *
+     * @param suffix desired output length in bits (one of 224, 256, 384, 512)
+     * @param X data to be hashed
+     * @param out hash value buffer (if null, this method allocates it with the required size)
+     * @return the out buffer containing the desired hash value.
+     */
     public static byte[] SHA3(int suffix, byte[] X, byte[] out) {
-        if (out == null) out = new byte[suffix / 8]; // allocate if needed
-        SHA3SHAKE s = new SHA3SHAKE();
-        s.initSHA3(suffix); // use SHA-3 domain byte (0x06)
-        s.absorb(X);        // feed entire input
-        return s.digest(out); // finalize and return hash
+        if (suffix != 224 && suffix != 256 && suffix != 384 && suffix != 512) {
+            throw new IllegalArgumentException("SHA3 suffix must be one of 224, 256, 384, 512");
+        }
+        int digestLen = suffix / 8;
+        if (out == null) {
+            out = new byte[digestLen];
+        }
+        if (out.length < digestLen) {
+            throw new IllegalArgumentException("out buffer is too small for SHA3 output");
+        }
+
+        SHA3SHAKE sponge = new SHA3SHAKE();
+        sponge.init(suffix);
+        sponge.absorb(X);
+        return sponge.digest(out);
     }
 
-    // -------------------------------------------------------
-    // SHAKE() — static shortcut for one-shot SHAKE hashing
-    // -------------------------------------------------------
+    /**
+     * Compute the streamlined SHAKE-<128,256> on input X with output bitlength L.
+     *
+     * @param suffix desired security level (either 128 or 256)
+     * @param X data to be hashed
+     * @param L desired output length in bits (must be a multiple of 8)
+     * @param out hash value buffer (if null, this method allocates it with the required size)
+     * @return the out buffer containing the desired hash value.
+     */
     public static byte[] SHAKE(int suffix, byte[] X, int L, byte[] out) {
-        if (out == null) out = new byte[L / 8]; // L is in bits
-        SHA3SHAKE s = new SHA3SHAKE();
-        s.initSHAKE(suffix); // use SHAKE domain byte (0x1F)
-        s.absorb(X);         // feed entire input
-        return s.squeeze(out, L / 8); // squeeze L/8 bytes of output
+        if (suffix != 128 && suffix != 256) {
+            throw new IllegalArgumentException("SHAKE suffix must be 128 or 256");
+        }
+        if (L < 0 || (L % 8) != 0) {
+            throw new IllegalArgumentException("SHAKE output length L must be >= 0 and a multiple of 8");
+        }
+
+        int outLen = L / 8;
+        if (out == null) {
+            out = new byte[outLen];
+        }
+        if (out.length < outLen) {
+            throw new IllegalArgumentException("out buffer is too small for SHAKE output");
+        }
+
+        SHA3SHAKE sponge = new SHA3SHAKE();
+        sponge.init(suffix);
+        sponge.absorb(X);
+        return sponge.squeeze(out, outLen);
     }
 
-    // -------------------------------------------------------
-    // keccakF() — the 24-round permutation (the blend button)
-    // scrambles all 25 lanes of the state completely
-    // -------------------------------------------------------
+    private void requireInitialized(String method) {
+        if (mode == Mode.UNINITIALIZED) {
+            throw new IllegalStateException(method + " requires init() first");
+        }
+    }
+
+    private byte selectSqueezeDomainByte() {
+        return (suffix == 128 || suffix == 256) ? DOMAIN_SHAKE : DOMAIN_SHA3;
+    }
+
+    private void finalizeAbsorb(byte domainByte) {
+        state[bufLen / 8] ^= (long) (domainByte & 0xFF) << (8 * (bufLen % 8));
+        state[(rate - 1) / 8] ^= 0x80L << (8 * ((rate - 1) % 8));
+        keccakF();
+        bufLen = 0;
+    }
+
+    private void squeezeInto(byte[] out, int len) {
+        for (int i = 0; i < len; i++) {
+            if (bufLen == rate) {
+                keccakF();
+                bufLen = 0;
+            }
+            out[i] = (byte) (state[bufLen / 8] >>> (8 * (bufLen % 8)));
+            bufLen++;
+        }
+    }
+
     private void keccakF() {
-        long[] A = state;      // work directly on the state
-        long[] B = new long[25]; // temp storage for pi step
-        long[] C = new long[5];  // column XORs for theta
-        long[] D = new long[5];  // mixed columns for theta
+        long[] A = state;
+        long[] B = new long[25];
+        long[] C = new long[5];
+        long[] D = new long[5];
 
         for (int round = 0; round < 24; round++) {
+            for (int x = 0; x < 5; x++) {
+                C[x] = A[x] ^ A[x + 5] ^ A[x + 10] ^ A[x + 15] ^ A[x + 20];
+            }
 
-            // θ (theta) step 1 — XOR all 5 rows of each column together
-            // C[x] = XOR of every lane in column x
-            for (int x = 0; x < 5; x++)
-                C[x] = A[x] ^ A[x+5] ^ A[x+10] ^ A[x+15] ^ A[x+20];
+            for (int x = 0; x < 5; x++) {
+                D[x] = C[(x + 4) % 5] ^ rotL(C[(x + 1) % 5], 1);
+            }
 
-            // θ (theta) step 2 — mix neighbouring columns
-            // D[x] = column to the left XOR (column to the right rotated 1)
-            for (int x = 0; x < 5; x++)
-                D[x] = C[(x+4)%5] ^ rotL(C[(x+1)%5], 1);
-
-            // θ (theta) step 3 — XOR the mix into every lane
-            // every lane gets influence from its neighbouring columns
-            for (int x = 0; x < 5; x++)
-                for (int y = 0; y < 5; y++)
-                    A[x + 5*y] ^= D[x];
-
-            // ρ (rho) + π (pi) combined
-            // rho: rotate each lane left by its RHO offset
-            // pi: move each lane to a new position in the grid
-            // doing both together saves a temporary array
-            for (int x = 0; x < 5; x++)
+            for (int x = 0; x < 5; x++) {
                 for (int y = 0; y < 5; y++) {
-                    int src = x + 5*y;           // source lane index
-                    // pi destination: (x,y) -> (y, 2x+3y mod 5)
-                    B[y + 5*((2*x + 3*y) % 5)] = rotL(A[src], RHO[src]);
+                    A[x + 5 * y] ^= D[x];
                 }
+            }
 
-            // χ (chi) — only non-linear step
-            // mixes lanes within each row using AND and NOT
-            // this is what makes Keccak cryptographically strong
-            for (int x = 0; x < 5; x++)
-                for (int y = 0; y < 5; y++)
-                    A[x + 5*y] = B[x + 5*y]
-                        ^ (~B[(x+1)%5 + 5*y] & B[(x+2)%5 + 5*y]);
+            for (int x = 0; x < 5; x++) {
+                for (int y = 0; y < 5; y++) {
+                    int src = x + 5 * y;
+                    B[y + 5 * ((2 * x + 3 * y) % 5)] = rotL(A[src], RHO[src]);
+                }
+            }
 
-            // ι (iota) — XOR round constant into lane[0] only
-            // breaks the symmetry between rounds so each round
-            // is unique — prevents slide attacks
+            for (int x = 0; x < 5; x++) {
+                for (int y = 0; y < 5; y++) {
+                    A[x + 5 * y] = B[x + 5 * y]
+                        ^ (~B[(x + 1) % 5 + 5 * y] & B[(x + 2) % 5 + 5 * y]);
+                }
+            }
+
             A[0] ^= RC[round];
         }
     }
 
-    // -------------------------------------------------------
-    // rotL() — rotate a 64-bit value left by n bits
-    // bits that fall off the left end wrap around to the right
-    // used by rho step to spread bits across the lane width
-    // -------------------------------------------------------
     private static long rotL(long x, int n) {
         return (x << n) | (x >>> (64 - n));
     }

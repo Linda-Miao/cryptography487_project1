@@ -1,8 +1,12 @@
-import java.io.*;
-import java.nio.file.*;
+/*
+ * TCSS 487 Cryptography Project 1
+ * Authors: Rudolf Arakelyan (rudik30) and Linda Miao
+ *
+ * Local self-test helper. The graded application entry point remains Main.java.
+ */
 
 public class Test {
-    public static void main(String[] args) throws Exception {
+    public static void runSelfTest() throws Exception {
 
         // ─── SHA3 NIST vectors ───────────────────────────────
         byte[] result = SHA3SHAKE.SHA3(256, new byte[0], null);

@@ -1,271 +1,287 @@
-import java.io.*;
-import java.nio.file.*;
-import java.security.SecureRandom; // cryptographically strong random numbers (for nonce)
+/*
+ * TCSS 487 Cryptography Project 1
+ * Authors: Rudolf Arakelyan (rudik30) and Linda Miao
+ */
+
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.SecureRandom;
 
 public class Main {
-    public static void main(String[] args) throws Exception{
-        if (args.length < 1){
-            printUsage(); // show them how to use the app
-            return; // stop here
-        }
-        switch (args[0]){
-            case "hash":   hash(args);     break; // service 1
-            case "mac":    mac(args);      break; // service 2
-            case "encrypt": encrypt(args); break;
-            case "decrypt": decrypt(args); break;
-            case "mactext": mactext(args); break; // bonus service
-            default:
-                System.out.println("Unknow command: " + args[0]);
-                printUsage();
-        }
+    private static final int NONCE_LEN = 16;
+    private static final int MAC_LEN = 32;
+    private static final SecureRandom RNG = new SecureRandom();
 
-    }
-
-    static void mactext(String[] args) throws Exception {
-        // check the user gave us all 3 arguments
-        if (args.length < 4){
-            System.out.println("Uasage: java Main mactext <text>  <passphrase> <outputLength>");
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            printUsage();
             return;
         }
-        
-        // get the text directly from args - no file need 
-        // user types the message right on the command line
-        byte[] data = args[1].getBytes("UTF-8");
 
-        // get passphrase as bytes
-        byte[] passphrase = args[2].getBytes("UTF-8");
-
-        //get desired output length in bytes
-        int outLen = Integer.parseInt(args[3]);
-        
-        // exatctly the same MAC logic as mac() - only the data source charged
-        SHA3SHAKE sponge = new SHA3SHAKE();
-        sponge.init(128); // absorb passphrase first
-        sponge.absorb(data); // then the text input diretly
-        byte[] mac = sponge.squeeze(outLen);
-
-        System.out.println("SHAKE-128 MAC of text (" + outLen + " bytes): " + toHex(mac));
+        try {
+            switch (args[0]) {
+                case "hash":
+                    hash(args);
+                    break;
+                case "mac":
+                    mac(args);
+                    break;
+                case "mactext":
+                    mactext(args);
+                    break;
+                case "encrypt":
+                    encrypt(args);
+                    break;
+                case "decrypt":
+                    decrypt(args);
+                    break;
+                default:
+                    System.out.println("Unknown command: " + args[0]);
+                    printUsage();
+            }
+        } catch (Exception ex) {
+            System.out.println("Error: " + ex.getMessage());
+        }
     }
+
     static void printUsage() {
         System.out.println("Usage:");
-        System.out.println("   java Main hash<file>");
-        System.out.println("   java Main mac<file> <passphrase> <outputLength>");
-        System.out.println("   java Main encrypt <file> <passphrase>");
-        System.out.println("   java Main decrypt <file> <passphrase>");
+        System.out.println("  java Main hash <file>");
+        System.out.println("  java Main mac <128|256> <file> <passphrase> <outputLengthBytes>");
+        System.out.println("  java Main mac <file> <passphrase> <outputLengthBytes>  # defaults to SHAKE-128");
+        System.out.println("  java Main mactext <128|256> <text> <passphrase> <outputLengthBytes>");
+        System.out.println("  java Main mactext <text> <passphrase> <outputLengthBytes>  # defaults to SHAKE-128");
+        System.out.println("  java Main encrypt <inputFile> <passphrase> <outputFile>");
+        System.out.println("  java Main encrypt <inputFile> <passphrase>  # output defaults to <inputFile>.enc");
+        System.out.println("  java Main decrypt <inputFile> <passphrase> <outputFile>");
+        System.out.println("  java Main decrypt <inputFile> <passphrase>  # output defaults to <inputFile>.dec");
     }
 
-    // hash - service 1 (required + bonus)
-    // reads a file and prints SHA3-224, SHA3-256, SHA3-384, SHA3-512 hashes
-    // arg[0] = "hash"
-    // arg[1] = path to the file to hash
-    // this is for bonus section that replace above section (hash - service 1;
-    static void hash(String[] args) throws Exception{
-        // check the user gave us a filename 
-        if (args.length < 2){
+    static void hash(String[] args) throws Exception {
+        if (args.length != 2) {
             System.out.println("Usage: java Main hash <file>");
             return;
         }
-        // read he entire file into a byte array
+
         byte[] data = Files.readAllBytes(Paths.get(args[1]));
-
-        // required: SHA3-256 and SHA3-512
-
-        // SHA3-256 and SHA3-512 bits = 32 bytes output 
-        // most common hash size, used for general integrity checking
+        byte[] h224 = SHA3SHAKE.SHA3(224, data, null);
         byte[] h256 = SHA3SHAKE.SHA3(256, data, null);
-
-        // SHA3-512 - 512 bits = 64 bytes output
-        // stronger version, used when extra security margin is needed
+        byte[] h384 = SHA3SHAKE.SHA3(384, data, null);
         byte[] h512 = SHA3SHAKE.SHA3(512, data, null);
 
-        // bonus: SHA3- 224 and SHA3-384
-        // smallest SHA3 variant, compatible with SHA-2 224-bit output
-        byte[] h224 = SHA3SHAKE.SHA3(224, data, null);
-
-        //SHA3-384 - 384 bits = 48 bytes output
-        // middle ground between 256 and 512 bit security
-        byte[] h384 = SHA3SHAKE.SHA3(384, data, null);
-
-        // print all four results in order of size
         System.out.println("SHA3-224: " + toHex(h224));
         System.out.println("SHA3-256: " + toHex(h256));
         System.out.println("SHA3-384: " + toHex(h384));
         System.out.println("SHA3-512: " + toHex(h512));
     }
 
-
-
-    // mac - service 2
-    // computes a SHAK-bases authentication tag(MAC); arg[0] = "mac; arg[1] = path to the file
-    // arg[2] = passphrase(the secret key); arg[3] = desired output length in bytes
     static void mac(String[] args) throws Exception {
-        // check the user gave us all 3 arguments
-        if(args.length < 4){
-            System.out.print("Useage: java Main max <file> <passphrase> <outputlength>");
+        int shakeLevel;
+        String fileArg;
+        String passphraseArg;
+        String outLenArg;
+
+        if (args.length == 5) {
+            shakeLevel = parseShakeLevel(args[1]);
+            fileArg = args[2];
+            passphraseArg = args[3];
+            outLenArg = args[4];
+        } else if (args.length == 4) {
+            shakeLevel = 128;
+            fileArg = args[1];
+            passphraseArg = args[2];
+            outLenArg = args[3];
+        } else {
+            System.out.println("Usage: java Main mac <128|256> <file> <passphrase> <outputLengthBytes>");
             return;
         }
 
-        byte[] data = Files.readAllBytes(Paths.get(args[1])); // read the file
+        byte[] data = Files.readAllBytes(Paths.get(fileArg));
+        byte[] passphrase = passphraseArg.getBytes(StandardCharsets.UTF_8);
+        int outLen = parseOutputLength(outLenArg);
 
-        byte[] passphrase = args[2].getBytes("UTF-8"); // get passphrase as bytes
-        int outLen = Integer.parseInt(args[3]); // get desired output length in bytes
-
-        SHA3SHAKE sponge = new SHA3SHAKE(); // create a SHAKE-128 sponge
-        sponge.init(128);
-
-        // absorb passphrase first, then the data
-        // order matters - passphrase acts the secret key
+        SHA3SHAKE sponge = new SHA3SHAKE();
+        sponge.init(shakeLevel);
         sponge.absorb(passphrase);
         sponge.absorb(data);
+        byte[] tag = sponge.squeeze(outLen);
 
-        byte[] mac = sponge.squeeze(outLen); // squeeze out the requested number of bytes
-
-        System.out.println("SHAKE-128 MAC (" + outLen + " bytes):  " + toHex(mac));
+        System.out.println("SHAKE-" + shakeLevel + " MAC (" + outLen + " bytes): " + toHex(tag));
     }
 
-    // encrypt — service 3 (required + bonus)
-    // encrypts a file using SHAKE-128 as a stream cipher
-    // stores nonce + ciphertext + SHA3-256 MAC tag in output file
-    // args[0] = "encrypt"
-    // args[1] = path to the file to encrypt
-    // args[2] = passphrase
+    static void mactext(String[] args) {
+        int shakeLevel;
+        String textArg;
+        String passphraseArg;
+        String outLenArg;
 
-    static void encrypt(String[] args) throws Exception{
-        // check the user gave us file and passphrase
-        if(args.length < 3){
-            System.out.println("Usage: java Main encrypt <file> <passphrase>");
+        if (args.length == 5) {
+            shakeLevel = parseShakeLevel(args[1]);
+            textArg = args[2];
+            passphraseArg = args[3];
+            outLenArg = args[4];
+        } else if (args.length == 4) {
+            shakeLevel = 128;
+            textArg = args[1];
+            passphraseArg = args[2];
+            outLenArg = args[3];
+        } else {
+            System.out.println("Usage: java Main mactext <128|256> <text> <passphrase> <outputLengthBytes>");
             return;
         }
-        // read the file to encrypt 
-        byte[] data = Files.readAllBytes(Paths.get(args[1]));
-        // get passphrase as bytes
-        byte[] passphrase = args[2].getBytes("UTF-8");
 
-        // step 1 - hash the passphrase to get a 128 -bit (16 byte) symmetric key
-        byte[] key = SHA3SHAKE.SHAKE(128, passphrase, 128, null);
-        // step 2 - generate a random 128-bit (16 byte) nonce
-        // nonce = number used once - makes every encryption unique
-        // even if you encrypt the same file twince with the same password
-        // the once encures the ciphertext is different each time
-        byte[] nonce = new byte[16];
-        new SecureRandom().nextBytes(nonce);
+        byte[] data = textArg.getBytes(StandardCharsets.UTF_8);
+        byte[] passphrase = passphraseArg.getBytes(StandardCharsets.UTF_8);
+        int outLen = parseOutputLength(outLenArg);
 
-        // step 3 - create keysstream by absorbing nonce then key 
         SHA3SHAKE sponge = new SHA3SHAKE();
-        sponge.init(128);
-        sponge.absorb(nonce); // absorb once first
-        sponge.absorb(key); // then the key
-        byte[] keystream = sponge.squeeze(data.length); 
-        // step 4 - XOR plaintext with keystream to get ciphertext
+        sponge.init(shakeLevel);
+        sponge.absorb(passphrase);
+        sponge.absorb(data);
+        byte[] tag = sponge.squeeze(outLen);
+
+        System.out.println("SHAKE-" + shakeLevel + " text MAC (" + outLen + " bytes): " + toHex(tag));
+    }
+
+    static void encrypt(String[] args) throws Exception {
+        if (args.length != 3 && args.length != 4) {
+            System.out.println("Usage: java Main encrypt <inputFile> <passphrase> <outputFile>");
+            return;
+        }
+
+        byte[] data = Files.readAllBytes(Paths.get(args[1]));
+        byte[] passphrase = args[2].getBytes(StandardCharsets.UTF_8);
+        String outFile = (args.length == 4) ? args[3] : args[1] + ".enc";
+
+        byte[] key = SHA3SHAKE.SHAKE(128, passphrase, 128, null);
+        byte[] nonce = new byte[NONCE_LEN];
+        RNG.nextBytes(nonce);
+
+        SHA3SHAKE stream = new SHA3SHAKE();
+        stream.init(128);
+        stream.absorb(nonce);
+        stream.absorb(key);
+        byte[] keystream = stream.squeeze(data.length);
+
         byte[] ciphertext = new byte[data.length];
-        for (int i = 0; i < data.length; i++)
-            ciphertext[i] = (byte)(data[i] ^ keystream[i]);
+        for (int i = 0; i < data.length; i++) {
+            ciphertext[i] = (byte) (data[i] ^ keystream[i]);
+        }
 
-        // Step 5 - bonus: compute MAC tag over the ciphertext
-        // we MAC the ciphertext (not plaintext) so we can verify
-        // integrity before decryption - encrypt-then-MAC pattern
-        // used SHA3-256 with the same key as encryption
         SHA3SHAKE macSponge = new SHA3SHAKE();
-        macSponge.init(256); // SHA3-256 for the MAC 
-        macSponge.absorb(key); //absorb the key first
-        macSponge.absorb(ciphertext); // then the ciphertext
-        byte[] mac = macSponge.digest(); // get the 32-byte MAC tag
+        macSponge.init(256);
+        macSponge.absorb(key);
+        macSponge.absorb(ciphertext);
+        byte[] mac = macSponge.digest();
 
-        // Step 6 - write nonce + ciphtext + MAC to output file
-        // layout: [16 bytes nonce ][ ciphertext ][ 32 bytes MAC]
-        String outFile = args[1] + ".enc";
         try (FileOutputStream fos = new FileOutputStream(outFile)) {
-            fos.write(nonce); // first 16 bytes = nounce
-            fos.write(ciphertext); // middle = ciphertext
-            fos.write(mac); // last 32 byes = MAC tag
+            fos.write(nonce);
+            fos.write(ciphertext);
+            fos.write(mac);
         }
 
         System.out.println("Encrypted to: " + outFile);
         System.out.println("Nonce: " + toHex(nonce));
-        System.out.println("Mac: " + toHex(mac));
+        System.out.println("MAC: " + toHex(mac));
     }
 
-    // decrypt - service 4 (required + bonus)
-    // decrypts a file and verifies the MAC tag
-    // args[0] = "decrypt"
-    // args[1] = path to the encrypted file
-    // args[2] = passphrase
- 
-
-    static void decrypt(String[] args) throws Exception{
-        // check the user gave us file and passphrase
-        if (args.length < 3){
-            System.out.println("Usage: java Main decrypt <file> <passphrase>");
+    static void decrypt(String[] args) throws Exception {
+        if (args.length != 3 && args.length != 4) {
+            System.out.println("Usage: java Main decrypt <inputFile> <passphrase> <outputFile>");
             return;
         }
-        // read the encrypted file (nonce + ciphtext)
+
         byte[] fileData = Files.readAllBytes(Paths.get(args[1]));
-        // get passphrase as bytes
-        byte[] passphrase = args[2].getBytes("UTF-8");
-        // step 1 - extract the nonce from the first 16 bytes
-        byte[] nonce = new byte[16];
-        System.arraycopy(fileData, 0, nonce, 0, 16);
+        if (fileData.length < NONCE_LEN + MAC_LEN) {
+            throw new IllegalArgumentException("ciphertext is too short to contain nonce and MAC");
+        }
 
-        // step 2 = extract MAC from last 32 bytes
-        // bonus: MAC tag is stored at the end of the file
-        byte[] storedMac = new byte[32];
-        System.arraycopy(fileData, fileData.length - 32, storedMac, 0, 32);
+        byte[] passphrase = args[2].getBytes(StandardCharsets.UTF_8);
+        String outFile;
+        if (args.length == 4) {
+            outFile = args[3];
+        } else if (args[1].endsWith(".enc")) {
+            outFile = args[1].substring(0, args[1].length() - 4) + ".dec";
+        } else {
+            outFile = args[1] + ".dec";
+        }
 
-        // step 3 - extract ciphertext (everthing between nonce and MAC)
-        // File layout:[ 16 nonce ][ ciphtext ][ 32 MAC ]
-        byte[] ciphertext = new byte[fileData.length - 16 - 32];
-        System.arraycopy(fileData, 16, ciphertext, 0, ciphertext.length); 
+        byte[] nonce = new byte[NONCE_LEN];
+        System.arraycopy(fileData, 0, nonce, 0, NONCE_LEN);
 
-        // Step 4 - recreate the same key from passphrase
+        byte[] storedMac = new byte[MAC_LEN];
+        System.arraycopy(fileData, fileData.length - MAC_LEN, storedMac, 0, MAC_LEN);
+
+        byte[] ciphertext = new byte[fileData.length - NONCE_LEN - MAC_LEN];
+        System.arraycopy(fileData, NONCE_LEN, ciphertext, 0, ciphertext.length);
+
         byte[] key = SHA3SHAKE.SHAKE(128, passphrase, 128, null);
 
+        SHA3SHAKE macSponge = new SHA3SHAKE();
+        macSponge.init(256);
+        macSponge.absorb(key);
+        macSponge.absorb(ciphertext);
+        byte[] computedMac = macSponge.digest();
 
-        // step 5 - bonus: verify MAC before decrepting
-        // recomupte MAC from ciphertext using same key
-        // if MAC doen't match, file was tampered with - reject it 
-        SHA3SHAKE sponge = new SHA3SHAKE();
-        sponge.init(256);
-        sponge.absorb(key); // same key from passp
-        sponge.absorb(ciphertext); 
-        byte[] computedMac = sponge.digest();
-
-        // compare stored MAC vs computed MAC byte by byte
-        boolean macOk = java.util.Arrays.equals(storedMac, computedMac);
-        if (!macOk) {
-            System.out.println("MAC FAILED - file may have been tampered with!");
-            return; // stop - do not decrypt a tampered file 
+        if (!constantTimeEquals(storedMac, computedMac)) {
+            System.out.println("MAC verification failed. File may have been tampered with.");
+            return;
         }
-        System.out.println("MAC verified — file is authentic.");
+        System.out.println("MAC verified.");
 
-        // step 6 - recreate the same keystream (nonce then key)
-        SHA3SHAKE disSponge = new SHA3SHAKE();
-        sponge.init(128);
-        sponge.absorb(nonce);
-        sponge.absorb(key);
-        byte[] keystream = sponge.squeeze(ciphertext.length);
+        SHA3SHAKE stream = new SHA3SHAKE();
+        stream.init(128);
+        stream.absorb(nonce);
+        stream.absorb(key);
+        byte[] keystream = stream.squeeze(ciphertext.length);
 
-        // Step 7 - XOR ciphertext with keystream to recover plaintext
-        // XOR is its own inverse: ciphertext XOR keystream = plaintext
         byte[] plaintext = new byte[ciphertext.length];
-        for (int i = 0; i < ciphertext.length; i++){
-            plaintext[i] = (byte)(ciphertext[i] ^ keystream[i]);
+        for (int i = 0; i < ciphertext.length; i++) {
+            plaintext[i] = (byte) (ciphertext[i] ^ keystream[i]);
         }
 
-        // step 8 - write plaintext to output file
-        String outFile = args[1].replace(".enc", ".dec");
         Files.write(Paths.get(outFile), plaintext);
-        for (int i = 0; i < ciphertext.length; i++)
-            plaintext[i] = (byte)(ciphertext[i] ^ keystream[i]);
-           System.out.println("Decrypted to: " + outFile);
+        System.out.println("Decrypted to: " + outFile);
     }
 
-    // toHex - helper used by all services for printing output
-    // converts a byte array to a readable hex string. for instance [0x4A, 0xFF] -> "4aff"
-    static String toHex(byte[] b) {
+    static int parseShakeLevel(String arg) {
+        int level = Integer.parseInt(arg);
+        if (level != 128 && level != 256) {
+            throw new IllegalArgumentException("SHAKE level must be 128 or 256");
+        }
+        return level;
+    }
+
+    static int parseOutputLength(String arg) {
+        int outLen = Integer.parseInt(arg);
+        if (outLen < 1) {
+            throw new IllegalArgumentException("outputLengthBytes must be >= 1");
+        }
+        return outLen;
+    }
+
+    static boolean constantTimeEquals(byte[] a, byte[] b) {
+        if (a == null || b == null) {
+            return false;
+        }
+
+        int diff = a.length ^ b.length;
+        int maxLen = Math.max(a.length, b.length);
+        for (int i = 0; i < maxLen; i++) {
+            byte ai = (i < a.length) ? a[i] : 0;
+            byte bi = (i < b.length) ? b[i] : 0;
+            diff |= ai ^ bi;
+        }
+        return diff == 0;
+    }
+
+    static String toHex(byte[] data) {
         StringBuilder sb = new StringBuilder();
-        for(byte x : b)
-            sb.append(String.format("%02x", x & 0xFF));
+        for (byte b : data) {
+            sb.append(String.format("%02x", b & 0xFF));
+        }
         return sb.toString();
     }
-
 }
